@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from urllib.parse import urlparse
 
 import httpx
@@ -195,28 +196,50 @@ def _extract_domain(url: str) -> str:
 
 
 def _extract_themes(results: list[SERPResult]) -> list[TopicTheme]:
-    """Scan SERP titles and snippets for recurring topic signals."""
-    buckets: dict[str, tuple[str, list[str]]] = {
-        "guide":    ("Comprehensive guides and tutorials", []),
-        "beginner": ("Beginner resources",                 []),
-        "strategy": ("Strategy and planning",              []),
-        "tool":     ("Tools and software",                 []),
-        "tip":      ("Tips and best practices",            []),
-        "example":  ("Examples and case studies",          []),
-        "mistake":  ("Common mistakes and fixes",          []),
-        "advanced": ("Advanced techniques",                []),
-    }
-    for result in results:
-        text = f"{result.title} {result.snippet}".lower()
-        for kw, (_, sources) in buckets.items():
-            if kw in text:
-                sources.append(result.domain)
+    """Detect content angles that dominate the SERP for the given query.
 
-    return [
-        TopicTheme(theme=label, frequency=len(sources), sources=sources)
-        for _, (label, sources) in buckets.items()
-        if sources
+    Rather than generic keyword buckets, each pattern targets a real content
+    angle that the gap-analyzer can reason about when looking for what's missing.
+    """
+    angle_patterns: list[tuple[str, str]] = [
+        (r"\b(top|best|leading|greatest)\s+\d+\b|\blist\b",
+         "Ranked / curated lists"),
+        (r"\b(step.by.step|how.to|tutorial|walkthrough|guide|instructions)\b",
+         "Step-by-step tutorials and how-to guides"),
+        (r"\b(comparison|vs\.?|versus|compared(?:\sto)?|alternatives?|difference)\b",
+         "Comparisons and alternatives"),
+        (r"\b(beginner|starter|introduction|getting.started|basics|101|newbie)\b",
+         "Beginner and introductory content"),
+        (r"\b(review|reviewed|tested|hands.on|tried|rated|rating|verdict)\b",
+         "Reviews and hands-on testing"),
+        (r"\b(pric(?:e|ing|es)|cost|cheap|affordable|free\s+plan|paid|budget)\b",
+         "Pricing and cost comparisons"),
+        (r"\b(advanced|expert|professional|enterprise|in.depth|deep.dive|technical)\b",
+         "Advanced and expert-level content"),
+        (r"\b(trend|future|2024|2025|2026|latest|new|update|upcoming|modern)\b",
+         "Trends and up-to-date coverage"),
+        (r"\b(example|case.study|real.world|use.case|success.story|scenario)\b",
+         "Real-world examples and case studies"),
+        (r"\b(mistake|error|pitfall|avoid|wrong|problem|fix|issue|troubleshoot)\b",
+         "Common mistakes and troubleshooting"),
     ]
+
+    themes: list[TopicTheme] = []
+    for pattern, theme_name in angle_patterns:
+        matching_sources: list[str] = []
+        for result in results:
+            text = f"{result.title} {result.snippet}".lower()
+            if re.search(pattern, text) and result.domain not in matching_sources:
+                matching_sources.append(result.domain)
+        if matching_sources:
+            themes.append(TopicTheme(
+                theme=theme_name,
+                frequency=len(matching_sources),
+                sources=matching_sources,
+            ))
+
+    themes.sort(key=lambda t: -t.frequency)
+    return themes
 
 
 serp_service = SERPService()

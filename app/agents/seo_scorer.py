@@ -2,19 +2,23 @@
 Node: seo_scorer
 
 Programmatic SEO validation — no LLM calls. Deterministic and fully testable.
-Assembles the final Article object, scores it against 9 criteria, and stores
+Assembles the final Article object, scores it against 11 criteria, and stores
 both in state. Score < 75 triggers the revision loop; >= 75 → END.
 Updates job status to SCORING.
 """
 
 import logging
 
+import re
+
 from app.models.article import (
     Article,
+    KeywordAnalysis,
     LinkSet,
     SEOCheckResult,
     SEOMetadata,
     SEOScore,
+    SecondaryKeywordUsage,
 )
 from app.models.job import JobStatus
 from app.models.state import SEOPipelineState
@@ -35,15 +39,17 @@ PASS_THRESHOLD = 75.0
 
 # (check_name, points_possible)
 _CHECKS = [
-    ("keyword_in_title",        15),
-    ("keyword_in_first_100",    15),
+    ("keyword_in_title",        12),
+    ("keyword_in_first_100",    12),
     ("keyword_in_h2",           10),
-    ("keyword_density_1_3pct",  15),
-    ("meta_description_length", 10),
-    ("heading_hierarchy",       10),
-    ("internal_links_min_3",    10),
-    ("external_links_min_2",    10),
+    ("keyword_density_1_3pct",  12),
+    ("meta_description_length",  8),
+    ("heading_hierarchy",        8),
+    ("internal_links_min_3",     8),
+    ("external_links_min_2",     8),
     ("readability_flesch_60",    5),
+    ("word_count_target",       10),
+    ("secondary_keywords",       7),
 ]
 
 
@@ -74,14 +80,14 @@ def _run_checks(state: SEOPipelineState) -> list[SEOCheckResult]:
     # 1. Primary keyword in title
     kw_in_title = kw in title.lower()
     results.append(check(
-        "keyword_in_title", kw_in_title, 15,
+        "keyword_in_title", kw_in_title, 12,
         f"Title: '{title}'" if kw_in_title else f"Keyword '{kw}' not found in title: '{title}'",
     ))
 
     # 2. Primary keyword in first 100 words
     kw_in_intro = keyword_in_first_n_words(full_text, kw, 100)
     results.append(check(
-        "keyword_in_first_100", kw_in_intro, 15,
+        "keyword_in_first_100", kw_in_intro, 12,
         "Keyword found in opening." if kw_in_intro else "Keyword missing from first 100 words.",
     ))
 
@@ -96,21 +102,21 @@ def _run_checks(state: SEOPipelineState) -> list[SEOCheckResult]:
     # 4. Keyword density 1–3%
     density_ok = 1.0 <= density <= 3.0
     results.append(check(
-        "keyword_density_1_3pct", density_ok, 15,
+        "keyword_density_1_3pct", density_ok, 12,
         f"Density: {density:.2f}% {'(OK)' if density_ok else '— target 1–3%'}",
     ))
 
     # 5. Meta description 150–160 characters
     meta_ok = meta_description_length_ok(meta)
     results.append(check(
-        "meta_description_length", meta_ok, 10,
+        "meta_description_length", meta_ok, 8,
         f"Meta: {len(meta)} chars {'(OK)' if meta_ok else '— target 150–160'}",
     ))
 
     # 6. Heading hierarchy (no H3 before H2)
     hierarchy_ok = heading_hierarchy_valid(sections)
     results.append(check(
-        "heading_hierarchy", hierarchy_ok, 10,
+        "heading_hierarchy", hierarchy_ok, 8,
         "Heading hierarchy valid." if hierarchy_ok else "H3 appears before H2 — invalid hierarchy.",
     ))
 
@@ -118,7 +124,7 @@ def _run_checks(state: SEOPipelineState) -> list[SEOCheckResult]:
     internal_ok = len(links.internal) >= 3 if links else False
     internal_count = len(links.internal) if links else 0
     results.append(check(
-        "internal_links_min_3", internal_ok, 10,
+        "internal_links_min_3", internal_ok, 8,
         f"{internal_count} internal link(s) {'(OK)' if internal_ok else '— need at least 3'}",
     ))
 
@@ -126,7 +132,7 @@ def _run_checks(state: SEOPipelineState) -> list[SEOCheckResult]:
     external_ok = len(links.external) >= 2 if links else False
     external_count = len(links.external) if links else 0
     results.append(check(
-        "external_links_min_2", external_ok, 10,
+        "external_links_min_2", external_ok, 8,
         f"{external_count} external link(s) {'(OK)' if external_ok else '— need at least 2'}",
     ))
 
@@ -137,7 +143,96 @@ def _run_checks(state: SEOPipelineState) -> list[SEOCheckResult]:
         f"Flesch score: {fre:.1f} {'(OK)' if readable else '— target > 60 (simpler language)'}",
     ))
 
+    # 10. Word count vs target
+    total_words = count_words(full_text)
+    target = state.get("target_word_count", 0)
+    if target > 0:
+        ratio = total_words / target
+        if 0.85 <= ratio <= 1.15:
+            wc_points = 10
+            wc_detail = f"{total_words} words vs {target} target — within ±15% (OK)"
+        elif 0.70 <= ratio <= 1.30:
+            wc_points = 5
+            wc_detail = f"{total_words} words vs {target} target — within ±30% (partial)"
+        else:
+            wc_points = 0
+            wc_detail = f"{total_words} words vs {target} target — outside ±30%"
+    else:
+        wc_points = 10
+        wc_detail = "No target word count specified."
+    results.append(SEOCheckResult(
+        check="word_count_target",
+        passed=wc_points == 10,
+        points_earned=wc_points,
+        points_possible=10,
+        detail=wc_detail,
+    ))
+
+    # 11. Secondary keywords present in body (proportional credit)
+    secondary_kws = state.get("outline", None)
+    sec_kw_list = secondary_kws.secondary_keywords if secondary_kws else []
+    if sec_kw_list:
+        found = sum(1 for sk in sec_kw_list if sk.lower() in full_text.lower())
+        missing = [sk for sk in sec_kw_list if sk.lower() not in full_text.lower()]
+        ratio = found / len(sec_kw_list)
+        sec_points = round(7 * ratio)
+        passed_sec = ratio >= 0.8  # pass if ≥80% of secondary keywords present
+        results.append(SEOCheckResult(
+            check="secondary_keywords",
+            passed=passed_sec,
+            points_earned=sec_points,
+            points_possible=7,
+            detail=(
+                f"{found}/{len(sec_kw_list)} secondary keywords found (OK)"
+                if passed_sec
+                else f"{found}/{len(sec_kw_list)} secondary keywords found — missing: {missing}"
+            ),
+        ))
+    else:
+        results.append(check(
+            "secondary_keywords", True, 7,
+            "No secondary keywords defined.",
+        ))
+
     return results
+
+
+def _build_keyword_analysis(state: SEOPipelineState) -> KeywordAnalysis:
+    """Build a keyword usage report from the draft sections."""
+    sections = state["draft_sections"] or []
+    kw = state["primary_keyword"].lower()
+    outline = state["outline"]
+
+    full_text = clean_text(" ".join(s.content for s in sections))
+    density = keyword_density(full_text, kw)
+    in_title = kw in outline.title.lower()
+    in_intro = keyword_in_first_n_words(full_text, kw, 100)
+
+    # Which H2 headings contain the primary keyword
+    h2_with_kw = [
+        s.heading for s in sections
+        if s.level.value == "h2" and kw in s.heading.lower()
+    ]
+
+    # Secondary keyword usage
+    sec_kw_list = outline.secondary_keywords if outline else []
+    secondary_usage = []
+    for sk in sec_kw_list:
+        occurrences = len(re.findall(re.escape(sk.lower()), full_text.lower()))
+        secondary_usage.append(SecondaryKeywordUsage(
+            keyword=sk,
+            found=occurrences > 0,
+            count=occurrences,
+        ))
+
+    return KeywordAnalysis(
+        primary_keyword=state["primary_keyword"],
+        primary_density=density,
+        primary_in_title=in_title,
+        primary_in_intro=in_intro,
+        primary_in_h2_headings=h2_with_kw,
+        secondary_keywords=secondary_usage,
+    )
 
 
 def _assemble_article(state: SEOPipelineState, seo_score: SEOScore) -> Article:
@@ -155,6 +250,7 @@ def _assemble_article(state: SEOPipelineState, seo_score: SEOScore) -> Article:
         faq=state["faq"] or [],
         word_count=sum(s.word_count for s in (state["draft_sections"] or [])),
         seo_score=seo_score,
+        keyword_analysis=_build_keyword_analysis(state),
     )
 
 

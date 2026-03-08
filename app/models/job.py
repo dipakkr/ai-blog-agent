@@ -34,3 +34,11 @@ class JobDetailResponse(BaseModel):
     updated_at: datetime
     error: Optional[str] = None
     result: Optional[Article] = None
+
+
+class AttemptRecord(BaseModel):
+    attempt: int
+    timestamp: datetime
+    status: str
+    error: Optional[str] = None
+    result: Optional[Article] = None

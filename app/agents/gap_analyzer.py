@@ -28,7 +28,7 @@ class _GapList(BaseModel):
     gaps: list[ContentGap]
 
 
-def _build_prompt(topic: str, serp_data: SERPData) -> str:
+def _build_prompt(topic: str, serp_data: SERPData, content_brief: "ContentBrief | None" = None) -> str:
     results_summary = "\n".join(
         f"{r.position}. [{r.domain}] {r.title}\n   {r.snippet}"
         for r in serp_data.results[:8]
@@ -37,8 +37,17 @@ def _build_prompt(topic: str, serp_data: SERPData) -> str:
         f"- {t.theme} (seen in {t.frequency} results)"
         for t in serp_data.themes
     )
-    return f"""Topic: "{topic}"
+    brief_context = ""
+    if content_brief:
+        brief_context = f"""
+Content format: {content_brief.format}
+Target audience: {content_brief.audience}
+Tone: {content_brief.tone}
 
+Tailor gap analysis to this format — e.g., a tutorial needs "missing prerequisite steps" or "missing troubleshooting" gaps, a comparison needs "missing criteria" or "missing alternatives" gaps.
+"""
+    return f"""Topic: "{topic}"
+{brief_context}
 Top SERP results:
 {results_summary}
 
@@ -58,7 +67,7 @@ async def gap_analyzer(state: SEOPipelineState) -> dict:
     logger.info("[%s] gap_analyzer: identifying content gaps", job_id)
 
     try:
-        prompt = _build_prompt(state["topic"], state["serp_data"])
+        prompt = _build_prompt(state["topic"], state["serp_data"], state.get("content_brief"))
         result: _GapList = await llm_service.call_llm(
             prompt=prompt,
             system=SYSTEM,
@@ -67,8 +76,11 @@ async def gap_analyzer(state: SEOPipelineState) -> dict:
             max_tokens=2048,
         )
         logger.info("[%s] gap_analyzer: found %d gaps", job_id, len(result.gaps))
+        job_manager.save_pipeline_artifact(job_id, "gaps", [
+            {"topic": g.topic, "reason": g.reason, "priority": g.priority}
+            for g in result.gaps
+        ])
         return {"content_gaps": result.gaps, "status": JobStatus.RESEARCHING}
     except Exception as e:
-        logger.exception("[%s] gap_analyzer failed", job_id)
-        job_manager.update_status(job_id, JobStatus.FAILED, error=str(e))
-        return {"status": "researching_failed", "error": str(e)}
+        logger.exception("[%s] gap_analyzer failed — continuing with no gaps", job_id)
+        return {"content_gaps": [], "status": JobStatus.RESEARCHING, "error": str(e)}

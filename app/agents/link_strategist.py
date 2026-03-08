@@ -76,6 +76,5 @@ async def link_strategist(state: SEOPipelineState) -> dict:
         return {"links": links, "status": JobStatus.DRAFTING}
 
     except Exception as e:
-        logger.exception("[%s] link_strategist failed", job_id)
-        job_manager.update_status(job_id, JobStatus.FAILED, error=str(e))
-        return {"status": "drafting_failed", "error": str(e)}
+        logger.exception("[%s] link_strategist failed — continuing with empty links", job_id)
+        return {"links": None, "status": JobStatus.DRAFTING, "error": str(e)}

@@ -14,17 +14,37 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 
+def _strip_js_comments(text: str) -> str:
+    """Remove JavaScript-style // line comments from JSON text.
+
+    LLMs (especially OpenAI fallback) sometimes include // comments in JSON
+    output, which is invalid JSON. This strips them while preserving strings
+    that contain // (e.g. URLs).
+    """
+    # Remove single-line // comments that are NOT inside quoted strings.
+    # Strategy: match strings first (to skip them), then strip comments.
+    return re.sub(
+        r'("(?:[^"\\]|\\.)*")|//[^\n]*',
+        lambda m: m.group(1) if m.group(1) else "",
+        text,
+    )
+
+
 def _extract_json(text: str) -> str:
     """Extract the outermost JSON object or array from text.
 
     Handles:
     - Raw JSON
     - JSON wrapped in ```json ... ``` or ``` ... ``` fences
+    - JSON with JavaScript-style // comments (stripped before extraction)
     Uses greedy matching to correctly capture nested objects/arrays.
     """
     # Strip fences first, then search for JSON in the remainder
     fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     search_text = fenced.group(1) if fenced else text
+
+    # Strip JS-style comments that LLMs sometimes include
+    search_text = _strip_js_comments(search_text)
 
     # Greedy match — captures full nested structure
     raw = re.search(r"(\{.*\}|\[.*\])", search_text, re.DOTALL)
@@ -36,8 +56,11 @@ def _extract_json(text: str) -> str:
 def _structured_system(system: str, response_model: Type[BaseModel]) -> str:
     schema = json.dumps(response_model.model_json_schema(), indent=2)
     suffix = (
-        f"\n\nRespond with valid JSON that exactly matches this schema. "
-        f"Output only the JSON — no explanation, no markdown fences:\n{schema}"
+        f"\n\nYou MUST respond with a single JSON object whose fields are filled "
+        f"with real values based on the user's request. "
+        f"Do NOT return the schema itself. Do NOT return example placeholders. "
+        f"Do NOT wrap in markdown. Output only the filled JSON object.\n\n"
+        f"Required JSON structure:\n{schema}"
     )
     return f"{system}{suffix}".strip()
 

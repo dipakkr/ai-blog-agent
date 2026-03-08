@@ -6,7 +6,9 @@ FastAPI backend that generates SEO-optimized articles using a LangGraph agent pi
 
 ```bash
 uvicorn app.main:app --reload          # Start dev server (port 8000)
-pytest                                  # Run all tests
+rq worker seo_pipeline                 # Start RQ worker (requires Redis)
+python worker.py                       # Alternative worker entry point
+uv run --with pytest --with-requirements requirements.txt python -m pytest tests/ -q
 pytest tests/test_seo_scorer.py -v      # Run specific test file
 pytest --cov=app                        # Run with coverage
 ```
@@ -23,6 +25,7 @@ pytest --cov=app                        # Run with coverage
 | LLM | **Claude API** (primary) + **OpenAI fallback** | Shows multi-model thinking |
 | Data Models | **Pydantic v2** | Explicitly asked for structured data models |
 | Database | **SQLite + SQLAlchemy** | Job persistence without infra overhead |
+| Job Queue | **Redis + RQ** | Durable worker-process job execution; falls back to asyncio task when Redis unavailable |
 | SERP API | **SerpAPI** (free tier) | Real data > mocked data |
 | Testing | **Pytest** | SEO constraint validation |
 
@@ -30,11 +33,12 @@ pytest --cov=app                        # Run with coverage
 ### Core Flow
 
 ```
-POST /generate → Job Manager (SQLite) → LangGraph Pipeline → Response
+POST /generate → Job Manager (SQLite) → Redis/RQ Queue → Worker Process → LangGraph Pipeline
 
 Pipeline nodes (sequential, with one conditional loop):
-  START → serp_analyzer → gap_finder → outline_generator
-        → article_writer → link_strategist → faq_generator
+  START → serp_analyzer → competitor_analyzer → content_classifier
+        → gap_finder → outline_generator → article_writer
+        → link_strategist → faq_generator
         → seo_scorer →[score < 75]→ revision_agent → seo_scorer (loop, max 3x)
                      →[score >= 75]→ END
 ```
@@ -46,7 +50,15 @@ Pipeline nodes (sequential, with one conditional loop):
 │                   FastAPI Server                 │
 │  POST /generate  GET /jobs/{id}  GET /jobs       │
 │  POST /generate returns job_id immediately;      │
-│  pipeline runs via FastAPI BackgroundTasks       │
+│  pipeline is enqueued via app/queue.py           │
+└──────────────┬───────────────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────────────┐
+│           Redis Queue (RQ) — seo_pipeline        │
+│  Primary: dispatches to worker process           │
+│  Fallback: asyncio.create_task() (no Redis)      │
+│  Worker entry: worker.py / rq worker seo_pipeline│
 └──────────────┬───────────────────────────────────┘
                │
                ▼
@@ -65,21 +77,29 @@ Pipeline nodes (sequential, with one conditional loop):
 │           LangGraph Agent Pipeline               │
 │        (sequential — one node at a time)         │
 │                                                  │
-│  ┌─────────────┐                                 │
-│  │ serp_analyzer│                                │
-│  └──────┬──────┘                                 │
+│  ┌──────────────┐                                │
+│  │ serp_analyzer│  SerpAPI → SERP results        │
+│  └──────┬───────┘                                │
+│         ▼                                        │
+│  ┌──────────────────┐                            │
+│  │competitor_analyzer│ Scrape top 5 pages        │
+│  └──────┬────────────┘ H2s, word count, tables   │
+│         ▼                                        │
+│  ┌──────────────────┐                            │
+│  │content_classifier│ Format, audience, angle    │
+│  └──────┬───────────┘ → ContentBrief             │
 │         ▼                                        │
 │  ┌─────────────┐                                 │
 │  │ gap_finder  │                                 │
 │  └──────┬──────┘                                 │
 │         ▼                                        │
 │  ┌──────────────────┐                            │
-│  │ outline_generator│                            │
-│  └──────┬───────────┘                            │
+│  │ outline_generator│ Deterministic format       │
+│  └──────┬───────────┘ detection + nav filter     │
 │         ▼                                        │
 │  ┌──────────────┐                                │
-│  │article_writer│                                │
-│  └──────┬───────┘                                │
+│  │article_writer│ Section-by-section,            │
+│  └──────┬───────┘ H2/H3 weighted word budget     │
 │         ▼                                        │
 │  ┌────────────────┐                              │
 │  │ link_strategist│                              │
@@ -104,9 +124,13 @@ Pipeline nodes (sequential, with one conditional loop):
 ### Key Design Decisions
 
 1. **LangGraph over plain functions** — Conditional revision loop, built-in SQLite checkpointing for crash recovery, node-level testability
-2. **Section-by-section writing** — Each H2 section is generated independently with outline + SERP context. Stays within token limits, easier to revise individual sections
-3. **Real SERP data via SerpAPI** with mock fallback — Graceful degradation if API is down or rate-limited
-4. **Multi-model support** — LLM calls go through `services/llm_service.py` abstraction. Currently Claude (primary) + OpenAI (fallback). Never call LLM APIs directly from nodes
+2. **Redis/RQ job queue** — Pipeline runs in a separate worker process, not the FastAPI event loop. Survives server restarts. Falls back to asyncio task when Redis is unavailable (dev mode).
+3. **Section-by-section writing** — Each H2 section is generated independently with outline + SERP context. Stays within token limits, easier to revise individual sections. H2/H3 weighted word budget ensures total ≈ target.
+4. **Real SERP data via SerpAPI** with mock fallback — Graceful degradation if API is down or rate-limited
+5. **Multi-model support** — LLM calls go through `services/llm_service.py` abstraction. Currently Claude (primary) + OpenAI (fallback). Never call LLM APIs directly from nodes
+6. **Competitor scraping pipeline** — Top 5 SERP pages are scraped for real H2 structure, word count, tables, readability. Content area isolation (`<article>`, `<main>`) prevents nav/sidebar noise polluting H2 lists.
+7. **Deterministic format detection** — `outline_gen._detect_format()` overrides LLM classifier for clear topic signals (listicle/tutorial/comparison). More reliable than LLM-only classification.
+8. **Common headings only** — Outline prompt only receives headings that appear in 2+ competitor pages. Per-page H2 dumps cause nav-section hallucination.
 
 ### State Shape (single source of truth)
 
@@ -130,29 +154,33 @@ LangGraph's `SqliteSaver` persists state after every node. Each job gets a uniqu
 ## Project Structure
 
 ```
+worker.py                   # RQ worker entry point (run alongside the API)
 app/
 ├── main.py                 # FastAPI endpoints
-├── config.py               # Settings via pydantic-settings
+├── config.py               # Settings via pydantic-settings (incl. redis_url)
+├── queue.py                # Redis/RQ queue abstraction + asyncio fallback
 ├── models/                 # Pydantic models — THE contract
 │   ├── state.py            # SEOPipelineState (LangGraph state)
 │   ├── request.py          # API input models
 │   ├── article.py          # Article, SEO metadata, headings
-│   ├── serp.py             # SERPResult, ThemeAnalysis
+│   ├── serp.py             # SERPResult, ThemeAnalysis, ContentBrief
 │   └── job.py              # Job status, checkpoint info
 ├── agents/
 │   ├── pipeline.py         # LangGraph graph definition
 │   ├── serp_analyzer.py    # Fetch + analyze top 10 SERP results
+│   ├── content_classifier.py # Detect format/audience/angle from SERP
 │   ├── gap_analyzer.py     # Identify content gaps from SERP themes
-│   ├── outline_gen.py      # Build heading hierarchy from gaps
-│   ├── article_writer.py   # Write article section by section
+│   ├── outline_gen.py      # Build heading hierarchy (deterministic format detection)
+│   ├── article_writer.py   # Write article section by section (H2/H3 word budget)
 │   ├── link_strategist.py  # Internal + external link suggestions
 │   ├── faq_generator.py    # FAQ from "People Also Ask" patterns
 │   ├── seo_scorer.py       # Programmatic SEO validation
 │   └── revision_agent.py   # Rewrite weak sections based on score
 ├── services/
 │   ├── serp_service.py     # SerpAPI integration + mock fallback
+│   ├── scraper_service.py  # Competitor page scraper (content area isolation)
 │   ├── llm_service.py      # Multi-model abstraction (Claude/OpenAI)
-│   └── job_manager.py      # SQLite job persistence + status tracking
+│   └── job_manager.py      # SQLite job persistence + keyword extraction
 └── utils/
     ├── seo_utils.py         # Keyword density, Flesch-Kincaid, heading checks
     └── text_utils.py        # Token counting, text cleaning
@@ -187,9 +215,14 @@ Threshold for passing: overall score >= 75/100. Below triggers revision loop.
 
 - SerpAPI free tier: 100 searches/month. Use mock fallback in tests and when rate-limited
 - LLM token limits: long articles (3000+ words) must be generated section-by-section, never in one prompt
+- Word budget: H2 sections get weight 1.0, H3 sections 0.6. Total weight = h2_count + h3_count×0.6. Per-section budget = target / total_weight. This ensures all sections together ≈ target word count.
+- Section count ceiling: `min(15, target_word_count // 150)` for general, `min(12, target // 200)` for listicles. Prevents too many shallow sections.
 - Revision loop is capped at 3 iterations via `revision_count` — always check this to prevent infinite loops
 - SQLite checkpointer is single-writer. Fine for dev/demo. Production would use Postgres
 - The `seo_scorer` must be deterministic (no LLM calls) — pure Python validation so tests are reliable
+- Redis is optional: `app/queue.py` falls back to `asyncio.create_task()` when Redis is unavailable. No code change needed to run without Redis in dev.
+- RQ workers are synchronous — async pipeline is wrapped in `asyncio.run()` inside `run_pipeline_sync()` in `app/queue.py`
+- `primary_keyword` is auto-extracted from topic in `job_manager.create_job()` when not provided by the caller (`_extract_keyword_from_topic()` strips filler phrases)
 
 ## DO NOTs
 

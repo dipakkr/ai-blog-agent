@@ -9,11 +9,17 @@ openai>=1.50.0
 
 # Agent framework
 langgraph>=0.2.0
+langgraph-checkpoint-sqlite>=2.0.0
+aiosqlite>=0.20.0,<0.22.0
 langchain-anthropic>=0.3.0
 langchain-openai>=0.2.0
 
 # HTTP
 httpx>=0.27.0
+
+# HTML parsing (competitor scraper)
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
 
 # Database
 sqlalchemy>=2.0.0
@@ -23,6 +29,10 @@ textstat>=0.7.0
 
 # Config
 python-dotenv>=1.0.0
+
+# Job queue
+rq>=1.16.0
+redis>=5.0.0
 
 # Testing
 pytest>=8.0.0

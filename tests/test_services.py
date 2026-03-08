@@ -95,6 +95,18 @@ class TestExtractJson:
         text = '[{"a": 1}, {"b": 2}]'
         assert json.loads(_extract_json(text)) == [{"a": 1}, {"b": 2}]
 
+    def test_strips_js_line_comments(self):
+        import json
+        text = '{\n  "content": "hello world",\n  // This is a comment\n  "value": 42\n}'
+        result = json.loads(_extract_json(text))
+        assert result == {"content": "hello world", "value": 42}
+
+    def test_preserves_urls_in_strings(self):
+        import json
+        text = '{"url": "https://example.com/path"}'
+        result = json.loads(_extract_json(text))
+        assert result["url"] == "https://example.com/path"
+
 
 # ---------------------------------------------------------------------------
 # LLMService

@@ -70,6 +70,5 @@ async def faq_generator(state: SEOPipelineState) -> dict:
         return {"faq": result.items, "status": JobStatus.DRAFTING}
 
     except Exception as e:
-        logger.exception("[%s] faq_generator failed", job_id)
-        job_manager.update_status(job_id, JobStatus.FAILED, error=str(e))
-        return {"status": "drafting_failed", "error": str(e)}
+        logger.exception("[%s] faq_generator failed — continuing with empty FAQ", job_id)
+        return {"faq": [], "status": JobStatus.DRAFTING, "error": str(e)}

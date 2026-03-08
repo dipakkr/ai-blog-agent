@@ -18,16 +18,32 @@ logger = logging.getLogger(__name__)
 async def serp_analyzer(state: SEOPipelineState) -> dict:
     job_id = state["job_id"]
     job_manager.update_status(job_id, JobStatus.RESEARCHING)
-    logger.info("[%s] serp_analyzer: fetching SERP for '%s'", job_id, state["topic"])
+    # Search using primary_keyword — it's shorter and more targeted than the full topic.
+    # e.g. topic="The 10 best AI video generators in 2026", keyword="AI video generators"
+    search_query = state["primary_keyword"] or state["topic"]
+    logger.info("[%s] serp_analyzer: fetching SERP for '%s'", job_id, search_query)
 
     try:
-        serp_data = await serp_service.search(state["topic"])
+        serp_data = await serp_service.search(search_query)
         logger.info(
             "[%s] serp_analyzer: got %d results, %d PAA questions",
             job_id,
             len(serp_data.results),
             len(serp_data.people_also_ask),
         )
+        job_manager.save_pipeline_artifact(job_id, "serp", {
+            "query": serp_data.query,
+            "results": [
+                {"position": r.position, "title": r.title, "url": r.url,
+                 "domain": r.domain, "snippet": r.snippet}
+                for r in serp_data.results
+            ],
+            "people_also_ask": serp_data.people_also_ask,
+            "themes": [
+                {"theme": t.theme, "frequency": t.frequency, "sources": t.sources}
+                for t in serp_data.themes
+            ],
+        })
         return {"serp_data": serp_data, "status": JobStatus.RESEARCHING}
     except Exception as e:
         logger.exception("[%s] serp_analyzer failed", job_id)

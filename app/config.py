@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     primary_llm: str = "claude-sonnet-4-6"
     fallback_llm: str = "gpt-4o-mini"
 
+    # Redis / job queue
+    redis_url: str = "redis://localhost:6379/0"
+
     # Pipeline
     seo_score_threshold: float = 75.0
     max_revision_count: int = 3

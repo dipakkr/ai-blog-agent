@@ -38,6 +38,7 @@ class ArticleSection(BaseModel):
 class InternalLink(BaseModel):
     anchor_text: str
     suggested_url: str
+    domain: Optional[str] = None
     context: str
 
 
@@ -72,6 +73,21 @@ class SEOScore(BaseModel):
     passed: bool  # total >= threshold
 
 
+class SecondaryKeywordUsage(BaseModel):
+    keyword: str
+    found: bool
+    count: int
+
+
+class KeywordAnalysis(BaseModel):
+    primary_keyword: str
+    primary_density: float  # percentage, e.g. 1.74
+    primary_in_title: bool
+    primary_in_intro: bool  # first 100 words
+    primary_in_h2_headings: list[str]  # H2 headings that contain the keyword
+    secondary_keywords: list[SecondaryKeywordUsage]
+
+
 class SEOMetadata(BaseModel):
     title: str
     meta_description: str
@@ -87,3 +103,4 @@ class Article(BaseModel):
     faq: list[FAQItem]
     word_count: int = Field(ge=0)
     seo_score: Optional[SEOScore] = None
+    keyword_analysis: Optional[KeywordAnalysis] = None
