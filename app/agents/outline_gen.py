@@ -1,7 +1,9 @@
 """
 Node: outline_generator
 
-Generates a structured article outline from SERP analysis and content gaps.
+Generates a structured article outline from the content_brief strategy contract
+and content gaps. Consumes pre-computed fields (search_intent, has_subcategories,
+recommended_tools, suggested_section_count) instead of re-deriving them.
 Updates job status to OUTLINING.
 """
 
@@ -13,18 +15,46 @@ from app.models.job import JobStatus
 from app.models.state import SEOPipelineState
 from app.services.job_manager import job_manager
 from app.services.llm_service import llm_service
+from app.utils.seo_utils import keyword_fuzzy_match
+from app.utils.serp_utils import (
+    clean_competitor_headings,
+    extract_tool_names,
+    recommend_section_count,
+)
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# System prompt — restructured per feedback
+# ---------------------------------------------------------------------------
+
 SYSTEM = (
-    "You are an expert SEO content strategist. "
-    "Create detailed, well-structured article outlines optimised for both "
-    "search engines and human readers. Every outline must include a compelling "
-    "title, an SEO meta description (150–160 characters), and a hierarchy of "
-    "H2 and H3 sections with clear key points."
+    "You are an expert SEO content strategist. Create detailed, "
+    "well-structured article outlines optimised for both search engines "
+    "and human readers.\n\n"
+    "Output format:\n"
+    "- Title (include primary keyword naturally — variations and plurals are fine)\n"
+    "- Meta description (~155 characters, include primary keyword)\n"
+    "- Introduction key points (2–3 bullets; keyword must appear in first 100 words)\n"
+    "- H2/H3 hierarchy with 2–4 key points per section\n"
+    "- Conclusion with a CTA or recommendation\n\n"
+    "Rules:\n"
+    "- Only genuine article sections — NO navigation, sidebar, subscribe, "
+    "FAQ, editorial standards, or boilerplate sections\n"
+    "- Match section count to word count (~200–250 words per H2)\n"
+    "- For listicles: use H2 per item if the list is flat (e.g. 'n8n alternatives'). "
+    "Use H2 as category with H3 per item ONLY if natural categories exist "
+    "(e.g. 'Best AI Tools' could group by Writing, Image, Video)\n"
+    "- Weave content gaps into relevant sections — do NOT create separate "
+    "sections for each gap\n"
+    "- Tone: authoritative but accessible, unless specified otherwise"
 )
 
-# Headings that are clearly site navigation, sidebar, or footer — never article sections
+# ---------------------------------------------------------------------------
+# Regex patterns
+# ---------------------------------------------------------------------------
+
+# Headings that are clearly site navigation, sidebar, or footer
 _NAV_SECTION_RE = re.compile(
     r"^("
     r"get in touch|contact us?|follow us?|subscribe|sign up|newsletter|"
@@ -42,8 +72,10 @@ _NAV_SECTION_RE = re.compile(
 
 # Topic-level signals for deterministic format detection
 _LISTICLE_SIGNALS = re.compile(
+    r"^\d+\s+|"  # numeric prefix: "8 AI Agents", "10 Ways", "5 Tools"
     r"\b(best|top\s+\d+|top\s+\w+|tools?|apps?|generators?|platforms?|"
-    r"software|alternatives?|plugins?|extensions?|resources?|examples?)\b",
+    r"software|alternatives?|plugins?|extensions?|resources?|examples?|"
+    r"ways?|tips?|tricks?|strategies?|ideas?|hacks?)\b",
     re.IGNORECASE,
 )
 _TUTORIAL_SIGNALS = re.compile(
@@ -54,14 +86,21 @@ _COMPARISON_SIGNALS = re.compile(
     r"\b(vs\.?|versus|compared?|comparison|difference|which\s+is\s+better)\b",
     re.IGNORECASE,
 )
+_TOPIC_NUMBER_RE = re.compile(r"^(\d+)\s+")
 
+# Detects "alternatives" topics → flat listicle, no sub-categories
+_FLAT_LISTICLE_RE = re.compile(
+    r"\b(alternatives?|replacements?|substitutes?|competitors?|options?|picks?)\b",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _detect_format(topic: str, brief_format: "str | None") -> str:
-    """Deterministically override the classifier when topic clearly signals a format.
-
-    The LLM classifier can misread format (e.g. calling a 'best tools' listicle
-    an 'explainer'). Topic keywords are a reliable signal and take priority.
-    """
+    """Deterministically override the classifier when topic clearly signals a format."""
     if _COMPARISON_SIGNALS.search(topic):
         return "comparison"
     if _TUTORIAL_SIGNALS.search(topic):
@@ -69,6 +108,16 @@ def _detect_format(topic: str, brief_format: "str | None") -> str:
     if _LISTICLE_SIGNALS.search(topic):
         return "listicle"
     return brief_format or "explainer"
+
+
+def _is_flat_listicle(topic: str) -> bool:
+    """True when listicle items are all the same type (no natural sub-categories).
+
+    'Best n8n Alternatives' → flat (H2 per item).
+    'Best AI Tools for Marketing' → could be categorised (H2 = category, H3 = tool).
+    Used as fallback when content_brief.has_subcategories is not available.
+    """
+    return bool(_FLAT_LISTICLE_RE.search(topic))
 
 
 def _format_instructions(state: SEOPipelineState, effective_format: str) -> str:
@@ -79,10 +128,25 @@ def _format_instructions(state: SEOPipelineState, effective_format: str) -> str:
 
     format_section = f"CONTENT FORMAT: {effective_format}\n"
     if brief:
+        intent = brief.search_intent if brief.search_intent else "informational"
         format_section += (
+            f"SEARCH INTENT: {intent}\n"
             f"TARGET AUDIENCE: {brief.audience} — {brief.writing_style_notes}\n"
             f"TONE: {brief.tone.replace('_', ' ')}\n"
         )
+        # Intent-specific guidance
+        if intent == "commercial_investigation":
+            format_section += (
+                "INTENT NOTE: Readers are comparing options before buying. "
+                "Include pros/cons, pricing context, and clear recommendations.\n"
+            )
+        elif intent == "transactional":
+            format_section += (
+                "INTENT NOTE: Readers are ready to act. "
+                "Include clear CTAs, pricing, and setup/onboarding details.\n"
+            )
+    else:
+        format_section += "TONE: authoritative but accessible\n"
 
     patterns_section = ""
     if patterns_block:
@@ -102,57 +166,81 @@ def _format_instructions(state: SEOPipelineState, effective_format: str) -> str:
 def _build_competitor_block(state: SEOPipelineState, effective_format: str) -> str:
     """Build the competitor heading context block for the outline prompt.
 
-    ONLY uses headings that appear in 2+ competitor pages (common_headings) —
-    never raw per-page H2 dumps which contain sidebar/nav/footer noise.
-    For listicles, also extracts product/tool names from filtered H2s.
+    Consumes the strategy contract from content_brief where available:
+    - brief.recommended_tools → tool/product names (pre-extracted, pre-filtered)
+    - brief.has_subcategories → flat vs categorised listicle structure
+    Falls back to raw competitor_insights when brief is unavailable.
     """
     insights = state.get("competitor_insights")
+    brief = state.get("content_brief")
+
     if not insights or insights.pages_scraped == 0:
         return ""
 
+    target_wc = state["target_word_count"]
     is_listicle = effective_format == "listicle" or _LISTICLE_SIGNALS.search(state["topic"])
 
-    # --- Listicle: collect tool/product names from H2s across all scraped pages ---
-    if is_listicle:
-        seen: set[str] = set()
-        tool_names: list[str] = []
-        skip_generic = {
-            "introduction", "conclusion", "overview", "summary", "faq",
-            "what is", "how to", "pricing", "comparison", "benefits",
-            "features", "pros", "cons", "review",
-        }
-        for p in insights.pages:
-            if not p.scraped:
-                continue
-            for h in p.h2_headings:
-                if (
-                    not _NAV_SECTION_RE.match(h)
-                    and not any(s in h.lower() for s in skip_generic)
-                    and len(h) <= 80
-                ):
-                    key = h.lower().strip()
-                    if key not in seen:
-                        seen.add(key)
-                        tool_names.append(h)
+    # Competitor word count context
+    avg_wc = insights.avg_word_count if hasattr(insights, "avg_word_count") else 0
+    wc_note = ""
+    if avg_wc and abs(avg_wc - target_wc) > target_wc * 0.3:
+        if target_wc < avg_wc:
+            wc_note = (
+                f"\nNOTE: Competitors average {avg_wc} words but our target is {target_wc} words. "
+                f"Write a MORE FOCUSED, CONCISE piece — do not try to match competitor length.\n"
+            )
+        else:
+            wc_note = (
+                f"\nNOTE: Competitors average {avg_wc} words but our target is {target_wc} words. "
+                f"We aim for more comprehensive coverage than competitors.\n"
+            )
 
-        if tool_names:
-            structural_lines = "\n".join(f"  - {insights.structural_signals[i]}"
-                                         for i in range(min(3, len(insights.structural_signals))))
+    # --- Listicle: use strategy contract for tools and subcategory structure ---
+    if is_listicle:
+        # Prefer brief.recommended_tools (pre-extracted in content_classifier)
+        entities = list(brief.recommended_tools) if brief and brief.recommended_tools else []
+        # Fallback: extract from raw insights
+        if not entities:
+            entities = extract_tool_names(insights)
+
+        if entities:
+            structural_lines = "\n".join(
+                f"  - {insights.structural_signals[i]}"
+                for i in range(min(3, len(insights.structural_signals)))
+            )
+
+            # Use brief.has_subcategories if available, else fall back to topic heuristic
+            has_subcats = brief.has_subcategories if brief else not _is_flat_listicle(state["topic"])
+            if not has_subcats:
+                structure_guidance = (
+                    "LISTICLE STRUCTURE — FLAT LIST (all items are the same type):\n"
+                    "  H2 = EACH INDIVIDUAL ITEM (one H2 per tool/product/alternative)\n"
+                    "  Do NOT group into categories — the items are all in the same category."
+                )
+            else:
+                structure_guidance = (
+                    "LISTICLE STRUCTURE — CATEGORISED (items naturally group):\n"
+                    "  H2 = category name, H3 = individual item within that category.\n"
+                    "  Use 2-4 categories max. Each category must have 2+ items."
+                )
+
             return (
                 f"\nCOMPETITOR ANALYSIS ({insights.pages_scraped}/{insights.pages_attempted} pages scraped):\n"
                 f"{structural_lines}\n"
-                f"\nTOOL/PRODUCT NAMES FOUND IN COMPETITOR H2s "
-                f"(use these as your listicle items — pick the most relevant):\n"
-                + "\n".join(f"  - {name}" for name in tool_names[:12])
+                f"{wc_note}"
+                f"\n{structure_guidance}\n"
+                f"\nVALIDATED TOOLS/PRODUCTS FROM COMPETITORS (named products only):\n"
+                + "\n".join(f"  - {name}" for name in entities[:15])
             )
 
-    # --- Non-listicle: only show COMMON headings (2+ pages) — no per-page dumps ---
-    clean_common = [h for h in insights.common_headings if not _NAV_SECTION_RE.match(h)]
+    # --- Non-listicle: only show COMMON headings (2+ pages) ---
+    clean_common = clean_competitor_headings(insights.common_headings)
     structural_summary = "\n".join(f"  - {s}" for s in insights.structural_signals[:5])
 
     block = (
         f"\nCOMPETITOR ANALYSIS ({insights.pages_scraped}/{insights.pages_attempted} pages scraped):\n"
         f"{structural_summary}\n"
+        f"{wc_note}"
     )
     if clean_common:
         block += (
@@ -164,9 +252,17 @@ def _build_competitor_block(state: SEOPipelineState, effective_format: str) -> s
 
 
 def _build_prompt(state: SEOPipelineState, effective_format: str) -> str:
+    brief = state.get("content_brief")
+
+    # Only HIGH and MEDIUM priority gaps
+    all_gaps = state["content_gaps"] or []
+    relevant_gaps = [g for g in all_gaps if g.priority in ("high", "medium")]
+    if not relevant_gaps:
+        relevant_gaps = all_gaps[:4]
+
     gaps_text = "\n".join(
         f"- [{g.priority.upper()}] {g.topic}: {g.reason}"
-        for g in (state["content_gaps"] or [])
+        for g in relevant_gaps
     )
     format_block = _format_instructions(state, effective_format)
     competitor_block = _build_competitor_block(state, effective_format)
@@ -179,33 +275,89 @@ def _build_prompt(state: SEOPipelineState, effective_format: str) -> str:
             + ", ".join(insights.common_secondary_keywords)
         )
 
-    # Hard cap: ~150 words minimum per H2 keeps sections substantive
-    max_h2_sections = min(15, max(4, state["target_word_count"] // 150))
-    # For listicles, each tool gets its own H2 — cap at a number that fits the word count
-    if effective_format == "listicle":
-        max_h2_sections = min(12, max(4, state["target_word_count"] // 200))
+    target_wc = state["target_word_count"]
+
+    # Use strategy contract section count if available, else compute
+    topic_num_match = _TOPIC_NUMBER_RE.match(state["topic"])
+    exact_item_count = int(topic_num_match.group(1)) if topic_num_match else None
+    avg_h2 = insights.avg_h2_count if insights else 0
+
+    if brief and brief.suggested_section_count:
+        rec_sections = brief.suggested_section_count
+        _, section_math = recommend_section_count(
+            target_wc, avg_h2, effective_format, exact_item_count,
+        )
+    else:
+        rec_sections, section_math = recommend_section_count(
+            target_wc, avg_h2, effective_format, exact_item_count,
+        )
+
+    if exact_item_count:
+        section_count_instruction = (
+            f"SECTION COUNT: The topic promises exactly {exact_item_count} items. "
+            f"Generate EXACTLY {exact_item_count} H2 sections — one per item. "
+            f"Do NOT add intro/conclusion as H2 sections.\n"
+            f"Math: {section_math}"
+        )
+        listicle_item_note = (
+            f"\nCRITICAL: This is a '{exact_item_count}-item' listicle. "
+            f"Every H2 must be a specific named item (tool, agent, strategy, etc.). "
+            f"Do NOT generate generic H2s like 'Introduction', 'Conclusion', 'How to Choose'."
+        )
+    else:
+        words_per_section = target_wc // max(1, rec_sections)
+        section_count_instruction = (
+            f"SECTION COUNT: Generate {rec_sections} H2 sections "
+            f"(~{words_per_section} words each to be substantive).\n"
+            f"Math: {section_math}"
+        )
+        listicle_item_note = ""
+
+    # Gap instruction: weave into sections, don't create standalone gap sections
+    gap_instruction = ""
+    if gaps_text:
+        gap_instruction = (
+            f"\nContent gaps to address (weave into relevant sections, do NOT create separate sections per gap):\n"
+            f"{gaps_text}\n"
+        )
+
+    # Edge case: short articles
+    short_article_note = ""
+    if target_wc < 800:
+        short_article_note = (
+            "\nNOTE: This is a short article (<800 words). Keep sections concise. "
+            "3-4 H2 sections max. Skip intro/conclusion H2s — use the title and "
+            "a brief opening paragraph instead.\n"
+        )
+
+    # Edge case: minimal competitor data
+    sparse_data_note = ""
+    if insights and insights.pages_scraped <= 1:
+        sparse_data_note = (
+            "\nNOTE: Only 1 competitor page was successfully scraped. "
+            "Rely more on topic expertise and PAA questions than competitor structure.\n"
+        )
 
     return f"""Create a comprehensive SEO article outline for:
 
 Topic: "{state['topic']}"
 Primary keyword: "{state['primary_keyword']}"
-Target word count: {state['target_word_count']} words
+Target word count: {target_wc} words
 Language: {state['language']}
 
-{format_block}
-Content gaps to address (prioritised):
-{gaps_text}
-{competitor_block}
+{format_block}{gap_instruction}{competitor_block}
 {secondary_kw_block}
+{listicle_item_note}{short_article_note}{sparse_data_note}
 
 Requirements:
-- Title must include the primary keyword naturally
-- Meta description must be exactly 150–160 characters and include the primary keyword
-- SECTION COUNT: Generate AT MOST {max_h2_sections} H2 sections.
-  This article is {state['target_word_count']} words — too many sections = too shallow.
+- Title must include the primary keyword naturally (variations/plurals are fine)
+- Meta description: ~155 characters, include primary keyword (we validate length programmatically)
+- {section_count_instruction}
 - Each section must list 2–4 specific key points to cover
-- Sections must be genuine article content — NO navigation, contact, subscription, sidebar, or podcast sections
-- Do NOT copy competitor page navigation elements as sections (e.g. "Get in Touch", "Top Posts", "Subscribe")"""
+- INTRODUCTION: Include 2–3 key points. The primary keyword MUST appear in the first 100 words. Hook the reader with a specific fact, question, or bold claim.
+- CONCLUSION: Include a summary + clear recommendation or CTA. Do NOT title it generically.
+- Sections must be genuine article content — NO navigation, contact, subscription, sidebar, FAQ, or editorial boilerplate sections
+- Do NOT copy competitor page navigation elements as sections"""
 
 
 def _filter_nav_sections(sections: list[OutlineSection]) -> list[OutlineSection]:
@@ -259,30 +411,33 @@ async def outline_generator(state: SEOPipelineState) -> dict:
             )
             outline = outline.model_copy(update={"sections": clean_sections})
 
-        # --- Enforce keyword in title ---
+        # --- Check keyword presence in title (fuzzy — handles plural/variations) ---
         kw = state["primary_keyword"].lower()
-        if kw not in outline.title.lower():
-            outline = outline.model_copy(update={"title": f"{state['primary_keyword']}: {outline.title}"})
-            logger.info("[%s] outline_generator: keyword prepended to title", job_id)
+        if not keyword_fuzzy_match(outline.title, kw):
+            logger.warning(
+                "[%s] outline_generator: keyword '%s' weakly present in title '%s'",
+                job_id, kw, outline.title,
+            )
 
         # --- Enforce meta description length (150–160 chars) ---
         meta = outline.meta_description.strip()
-        if not (150 <= len(meta) <= 160):
-            if len(meta) > 160:
+        if not (140 <= len(meta) <= 165):
+            if len(meta) > 165:
                 truncated = meta[:157]
                 last_space = truncated.rfind(" ")
                 meta = (truncated[:last_space] if last_space > 140 else truncated) + "..."
-            else:
+            elif len(meta) < 140:
                 suffix = f" A complete guide to {state['primary_keyword']}."
                 meta = (meta + suffix)[:160].rsplit(" ", 1)[0]
             outline = outline.model_copy(update={"meta_description": meta})
 
-        # --- Enforce keyword in at least one H2 heading ---
+        # --- Check keyword presence in H2 headings (fuzzy) ---
         h2_headings = [s.heading for s in outline.sections if s.level.value == "h2"]
-        if h2_headings and not any(kw in h.lower() for h in h2_headings):
-            first = outline.sections[0]
-            patched = first.model_copy(update={"heading": f"{state['primary_keyword']}: {first.heading}"})
-            outline = outline.model_copy(update={"sections": [patched] + list(outline.sections[1:])})
+        if h2_headings and not any(keyword_fuzzy_match(h, kw) for h in h2_headings):
+            logger.warning(
+                "[%s] outline_generator: keyword '%s' not found in any H2 heading",
+                job_id, kw,
+            )
 
         logger.info(
             "[%s] outline_generator: '%s' | format=%s | %d sections",

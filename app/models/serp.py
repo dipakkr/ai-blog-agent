@@ -48,6 +48,7 @@ class CompetitorInsights(BaseModel):
     common_headings: list[str]       # headings appearing in 2+ results verbatim/near-verbatim
     structural_signals: list[str]    # e.g. "4/5 pages use numbered lists", "avg 1800 words"
     common_secondary_keywords: list[str]  # keywords frequent across multiple pages
+    top_entities: list[str] = []    # named entities (tools/products/brands) ranked by SERP frequency
     pages: list[CompetitorPage]
 
 
@@ -69,3 +70,10 @@ class ContentBrief(BaseModel):
     competitive_angle: str          # what differentiated angle to take vs competitors
     writing_style_notes: str        # vocabulary level, sentence structure derived from snippets
     suggested_section_count: int    # derived from avg competitor section count
+
+    # Strategy contract fields — consumed by outline_generator
+    search_intent: Literal[
+        "informational", "commercial_investigation", "transactional", "navigational"
+    ] = "informational"
+    has_subcategories: bool = False  # True if items naturally group (e.g. "AI Tools" → Writing, Image, Video)
+    recommended_tools: list[str] = []  # pre-extracted tool/product names from competitor data

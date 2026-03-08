@@ -119,6 +119,61 @@ def _extract_headings(soup: BeautifulSoup, tag: str) -> list[str]:
     return filtered
 
 
+# First words of headings that signal a topic/category, not an entity/product name.
+# Headings starting with these are structural (e.g. "Best AI Tools") not entities.
+_ENTITY_SKIP_FIRST_WORDS = {
+    "best", "top", "how", "what", "why", "when", "where", "which", "all",
+    "every", "the", "a", "an", "introduction", "overview", "comparison",
+    "getting", "using", "understanding", "exploring", "choosing", "finding",
+    "are", "is", "do", "does", "can", "will", "should",
+}
+
+
+def _extract_entities(pages: list["CompetitorPage"]) -> list[str]:
+    """Extract named entities (tool/product/brand names) from H2 and H3 headings.
+
+    Entities are short, capitalized heading phrases that represent real products —
+    e.g. "Jasper", "Copy.ai", "Notion AI". Generic topic headings like
+    "Best AI Writing Tools" or "How to Choose" are excluded.
+
+    Returns a list ranked by frequency across pages (most-mentioned first).
+    """
+    counter: Counter = Counter()
+
+    for page in pages:
+        if not page.scraped:
+            continue
+        seen_this_page: set[str] = set()
+        for heading in page.h2_headings + page.h3_headings:
+            h = heading.strip()
+            # Must be short — entity names are not full sentences
+            if not (2 <= len(h) <= 40):
+                continue
+            # Must start with uppercase (proper noun / product name)
+            if not h[0].isupper():
+                continue
+            # Skip all-caps abbreviations (FAQ, SEO, etc.) unless very short
+            if h.isupper() and len(h) > 4:
+                continue
+            # Skip questions
+            if h.endswith("?"):
+                continue
+            # Skip if first word signals a category heading, not an entity
+            first_word = h.split()[0].lower().rstrip("s")
+            if first_word in _ENTITY_SKIP_FIRST_WORDS:
+                continue
+            # Skip known nav patterns
+            if _NAV_HEADING_RE.match(h):
+                continue
+            key = h.lower()
+            if key not in seen_this_page:
+                seen_this_page.add(key)
+                counter[h] += 1
+
+    # Return up to 20 entities sorted by frequency; filter singletons for quality
+    return [entity for entity, count in counter.most_common(20) if count >= 1]
+
+
 def _top_keywords(text: str, n: int = 15) -> list[str]:
     """Return top-N frequent non-stopword tokens (≥4 chars)."""
     tokens = re.findall(r"\b[a-zA-Z]{4,}\b", text.lower())
@@ -253,6 +308,8 @@ def _aggregate(pages: list[CompetitorPage], primary_keyword: str) -> CompetitorI
     wc_values = [p.word_count for p in scraped]
     signals.append(f"Word count range: {min(wc_values)}–{max(wc_values)} words")
 
+    top_entities = _extract_entities(pages)
+
     return CompetitorInsights(
         pages_attempted=len(pages),
         pages_scraped=n,
@@ -262,6 +319,7 @@ def _aggregate(pages: list[CompetitorPage], primary_keyword: str) -> CompetitorI
         common_headings=common_headings,
         structural_signals=signals,
         common_secondary_keywords=common_secondary,
+        top_entities=top_entities,
         pages=pages,
     )
 

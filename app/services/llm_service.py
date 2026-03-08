@@ -97,6 +97,15 @@ class LLMService:
             Parsed Pydantic instance if response_model is set, else raw string.
         """
         active_model = model or settings.primary_llm
+        model_label = response_model.__name__ if response_model else "text"
+        logger.debug(
+            "LLM call [model=%s, output=%s, temp=%.1f, max_tokens=%d]\n"
+            "── SYSTEM ──\n%s\n"
+            "── PROMPT (%d chars) ──\n%s",
+            active_model, model_label, temperature, max_tokens,
+            system[:500] + ("..." if len(system) > 500 else ""),
+            len(prompt), prompt,
+        )
         try:
             return await self._call_claude(
                 prompt=prompt,
@@ -150,6 +159,14 @@ class LLMService:
         if not response.content:
             raise RuntimeError("Claude returned an empty response content list.")
         text = response.content[0].text.strip()
+        logger.debug(
+            "LLM response [model=%s, tokens=%d/%d]\n── RESPONSE (%d chars) ──\n%s",
+            model,
+            response.usage.input_tokens if response.usage else 0,
+            response.usage.output_tokens if response.usage else 0,
+            len(text),
+            text[:2000] + ("..." if len(text) > 2000 else ""),
+        )
         if response_model:
             return response_model.model_validate_json(_extract_json(text))
         return text

@@ -77,7 +77,7 @@ def run_pipeline_sync(
 # Public API
 # ---------------------------------------------------------------------------
 
-def enqueue_pipeline(
+async def enqueue_pipeline(
     job_id: str,
     topic: str,
     primary_keyword: str,
@@ -87,6 +87,8 @@ def enqueue_pipeline(
     """Enqueue a pipeline job.
 
     Returns "queued" if dispatched to Redis/RQ, "inline" if fallback was used.
+    Must be called from an async context (FastAPI handler) so that the inline
+    fallback can safely schedule a coroutine on the running event loop.
     """
     if _queue is not None:
         _queue.enqueue(
@@ -101,10 +103,11 @@ def enqueue_pipeline(
         logger.info("Job %s enqueued to Redis queue", job_id)
         return "queued"
 
-    # Fallback: fire an asyncio task in the current event loop (dev mode)
+    # Fallback: schedule as a background coroutine on the running event loop.
+    # asyncio.create_task() requires an active event loop (guaranteed in an async
+    # FastAPI handler) — avoids the get_event_loop() deprecation in Python 3.10+.
     logger.info("Job %s running inline (no Redis)", job_id)
-    loop = asyncio.get_event_loop()
-    loop.create_task(_run_inline(job_id, topic, primary_keyword, target_word_count, language))
+    asyncio.create_task(_run_inline(job_id, topic, primary_keyword, target_word_count, language))
     return "inline"
 
 

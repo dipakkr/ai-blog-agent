@@ -12,7 +12,7 @@ import json
 
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, patch, MagicMock
 
 from app.main import app
 from app.models.job import JobStatus
@@ -21,6 +21,14 @@ from app.models.job import JobStatus
 @pytest.fixture
 def client():
     return TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def mock_enqueue():
+    """Prevent tests from pushing real jobs to Redis."""
+    with patch("app.main.enqueue_pipeline", new_callable=AsyncMock) as _mock:
+        _mock.return_value = "queued"
+        yield _mock
 
 
 @pytest.fixture(autouse=True)

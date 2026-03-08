@@ -116,6 +116,7 @@ def _make_state(**overrides) -> dict:
         "target_word_count": 1500,
         "language": "en",
         "serp_data": None,
+        "competitor_insights": None,  # entity_coverage defaults to pass when None
         "content_brief": None,
         "content_gaps": None,
         "outline": _make_outline(),
@@ -295,6 +296,48 @@ class TestSecondaryKeywords:
         state = _make_state(outline=outline)
         results = _run_checks(state)
         check = next(c for c in results if c.check == "secondary_keywords")
+        assert not check.passed
+
+
+class TestEntityCoverage:
+    def test_passes_with_no_entity_data(self):
+        """No competitor_insights → full points (can't penalise missing scrape)."""
+        state = _make_state(competitor_insights=None)
+        results = _run_checks(state)
+        check = next(c for c in results if c.check == "entity_coverage")
+        assert check.passed
+        assert check.points_earned == 5
+
+    def test_passes_when_entities_covered(self):
+        from app.models.serp import CompetitorInsights, CompetitorPage
+        insights = CompetitorInsights(
+            pages_attempted=5, pages_scraped=3,
+            avg_word_count=1500, avg_h2_count=5.0,
+            suggested_section_count=5,
+            common_headings=[], structural_signals=[],
+            common_secondary_keywords=[],
+            top_entities=["word", "ci/cd tools"],  # both appear in body text
+            pages=[],
+        )
+        state = _make_state(competitor_insights=insights)
+        results = _run_checks(state)
+        check = next(c for c in results if c.check == "entity_coverage")
+        assert check.passed
+
+    def test_fails_when_entities_missing(self):
+        from app.models.serp import CompetitorInsights
+        insights = CompetitorInsights(
+            pages_attempted=5, pages_scraped=3,
+            avg_word_count=1500, avg_h2_count=5.0,
+            suggested_section_count=5,
+            common_headings=[], structural_signals=[],
+            common_secondary_keywords=[],
+            top_entities=["xyzunknowntool1", "xyzunknowntool2", "xyzunknowntool3"],
+            pages=[],
+        )
+        state = _make_state(competitor_insights=insights)
+        results = _run_checks(state)
+        check = next(c for c in results if c.check == "entity_coverage")
         assert not check.passed
 
 

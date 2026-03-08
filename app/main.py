@@ -59,7 +59,7 @@ async def generate_article(request: GenerateRequest) -> JobResponse:
     Returns immediately with the job_id so the client can poll /jobs/{id}.
     """
     job = job_manager.create_job(request)
-    enqueue_pipeline(job.id, job.topic, job.primary_keyword, job.target_word_count, job.language)
+    await enqueue_pipeline(job.id, job.topic, job.primary_keyword, job.target_word_count, job.language)
     return JobResponse(job_id=job.id, status=JobStatus(job.status))
 
 
@@ -90,7 +90,7 @@ async def retry_job(job_id: str) -> JobResponse:
 
     job_manager.save_to_history(job_id)
     job_manager.update_status(job_id, JobStatus.PENDING, error=None)
-    enqueue_pipeline(job.id, job.topic, job.primary_keyword, job.target_word_count, job.language)
+    await enqueue_pipeline(job.id, job.topic, job.primary_keyword, job.target_word_count, job.language)
     logger.info("Job %s re-enqueued for retry", job_id)
     return JobResponse(job_id=job.id, status=JobStatus.PENDING)
 

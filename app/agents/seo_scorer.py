@@ -27,6 +27,7 @@ from app.utils.seo_utils import (
     flesch_reading_ease,
     heading_hierarchy_valid,
     keyword_density,
+    keyword_fuzzy_match,
     keyword_in_first_n_words,
     keyword_in_headings,
     meta_description_length_ok,
@@ -37,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 PASS_THRESHOLD = 75.0
 
-# (check_name, points_possible)
+# (check_name, points_possible) — must sum to 100
 _CHECKS = [
     ("keyword_in_title",        12),
     ("keyword_in_first_100",    12),
@@ -47,9 +48,10 @@ _CHECKS = [
     ("heading_hierarchy",        8),
     ("internal_links_min_3",     8),
     ("external_links_min_2",     8),
-    ("readability_flesch_60",    5),
+    ("readability_flesch_60",    3),
     ("word_count_target",       10),
-    ("secondary_keywords",       7),
+    ("secondary_keywords",       4),
+    ("entity_coverage",          5),
 ]
 
 
@@ -77,8 +79,8 @@ def _run_checks(state: SEOPipelineState) -> list[SEOCheckResult]:
             detail=detail,
         )
 
-    # 1. Primary keyword in title
-    kw_in_title = kw in title.lower()
+    # 1. Primary keyword in title (fuzzy — handles plural/variations)
+    kw_in_title = keyword_fuzzy_match(title, kw)
     results.append(check(
         "keyword_in_title", kw_in_title, 12,
         f"Title: '{title}'" if kw_in_title else f"Keyword '{kw}' not found in title: '{title}'",
@@ -139,7 +141,7 @@ def _run_checks(state: SEOPipelineState) -> list[SEOCheckResult]:
     # 9. Flesch Reading Ease > 60
     readable = fre > 60.0
     results.append(check(
-        "readability_flesch_60", readable, 5,
+        "readability_flesch_60", readable, 3,
         f"Flesch score: {fre:.1f} {'(OK)' if readable else '— target > 60 (simpler language)'}",
     ))
 
@@ -175,13 +177,13 @@ def _run_checks(state: SEOPipelineState) -> list[SEOCheckResult]:
         found = sum(1 for sk in sec_kw_list if sk.lower() in full_text.lower())
         missing = [sk for sk in sec_kw_list if sk.lower() not in full_text.lower()]
         ratio = found / len(sec_kw_list)
-        sec_points = round(7 * ratio)
+        sec_points = round(4 * ratio)
         passed_sec = ratio >= 0.8  # pass if ≥80% of secondary keywords present
         results.append(SEOCheckResult(
             check="secondary_keywords",
             passed=passed_sec,
             points_earned=sec_points,
-            points_possible=7,
+            points_possible=4,
             detail=(
                 f"{found}/{len(sec_kw_list)} secondary keywords found (OK)"
                 if passed_sec
@@ -190,8 +192,38 @@ def _run_checks(state: SEOPipelineState) -> list[SEOCheckResult]:
         ))
     else:
         results.append(check(
-            "secondary_keywords", True, 7,
+            "secondary_keywords", True, 4,
             "No secondary keywords defined.",
+        ))
+
+    # 12. Entity coverage — key SERP entities mentioned in the article
+    # When no entity data is available (scraping failed), award full points so
+    # the check doesn't penalise topics where scraping was blocked.
+    insights = state.get("competitor_insights")
+    top_entities = insights.top_entities if insights else []
+    if top_entities:
+        entity_lower = [e.lower() for e in top_entities]
+        text_lower = full_text.lower()
+        found_entities = [e for e in entity_lower if e in text_lower]
+        coverage_ratio = len(found_entities) / len(entity_lower)
+        entity_points = round(5 * min(1.0, coverage_ratio / 0.6))  # full pts at ≥60% coverage
+        entity_passed = coverage_ratio >= 0.6
+        missing_entities = [top_entities[i] for i, e in enumerate(entity_lower) if e not in text_lower][:5]
+        results.append(SEOCheckResult(
+            check="entity_coverage",
+            passed=entity_passed,
+            points_earned=entity_points,
+            points_possible=5,
+            detail=(
+                f"{len(found_entities)}/{len(top_entities)} SERP entities covered ({coverage_ratio:.0%}) — OK"
+                if entity_passed
+                else f"{len(found_entities)}/{len(top_entities)} SERP entities covered — missing: {missing_entities}"
+            ),
+        ))
+    else:
+        results.append(check(
+            "entity_coverage", True, 5,
+            "No entity data available (scraping blocked or not applicable).",
         ))
 
     return results
@@ -205,13 +237,13 @@ def _build_keyword_analysis(state: SEOPipelineState) -> KeywordAnalysis:
 
     full_text = clean_text(" ".join(s.content for s in sections))
     density = keyword_density(full_text, kw)
-    in_title = kw in outline.title.lower()
+    in_title = keyword_fuzzy_match(outline.title, kw)
     in_intro = keyword_in_first_n_words(full_text, kw, 100)
 
-    # Which H2 headings contain the primary keyword
+    # Which H2 headings contain the primary keyword (fuzzy)
     h2_with_kw = [
         s.heading for s in sections
-        if s.level.value == "h2" and kw in s.heading.lower()
+        if s.level.value == "h2" and keyword_fuzzy_match(s.heading, kw)
     ]
 
     # Secondary keyword usage
@@ -243,7 +275,7 @@ def _assemble_article(state: SEOPipelineState, seo_score: SEOScore) -> Article:
             meta_description=outline.meta_description,
             primary_keyword=state["primary_keyword"],
             secondary_keywords=outline.secondary_keywords,
-            slug=slugify(outline.title),
+            slug=slugify(state["topic"]),
         ),
         sections=state["draft_sections"] or [],
         links=state["links"] or LinkSet(internal=[], external=[]),

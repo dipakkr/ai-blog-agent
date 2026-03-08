@@ -18,9 +18,11 @@ logger = logging.getLogger(__name__)
 async def serp_analyzer(state: SEOPipelineState) -> dict:
     job_id = state["job_id"]
     job_manager.update_status(job_id, JobStatus.RESEARCHING)
-    # Search using primary_keyword — it's shorter and more targeted than the full topic.
-    # e.g. topic="The 10 best AI video generators in 2026", keyword="AI video generators"
-    search_query = state["primary_keyword"] or state["topic"]
+    # Search using topic — it reflects actual user search intent and returns the
+    # competing pages we need to beat. e.g. "8 AI Agents for Content Creation"
+    # returns listicle competitors, while just "ai agent for content creation"
+    # returns generic explainer pages.
+    search_query = state["topic"]
     logger.info("[%s] serp_analyzer: fetching SERP for '%s'", job_id, search_query)
 
     try:

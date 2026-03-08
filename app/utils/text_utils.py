@@ -13,12 +13,15 @@ def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def slugify(text: str) -> str:
-    """Convert text to a URL-safe slug."""
+def slugify(text: str, max_length: int = 60) -> str:
+    """Convert text to a URL-safe slug, truncated at a word boundary."""
     text = text.lower().strip()
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"[\s_]+", "-", text)
-    return re.sub(r"-{2,}", "-", text).strip("-")
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    if len(text) > max_length:
+        text = text[:max_length].rsplit("-", 1)[0]
+    return text
 
 
 def estimate_tokens(text: str) -> int:

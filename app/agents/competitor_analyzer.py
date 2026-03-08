@@ -42,13 +42,14 @@ async def competitor_analyzer(state: SEOPipelineState) -> dict:
 
         logger.info(
             "[%s] competitor_analyzer: %d/%d scraped — avg %d words, %d common headings, "
-            "%d secondary keywords",
+            "%d secondary keywords, %d entities extracted",
             job_id,
             insights.pages_scraped,
             insights.pages_attempted,
             insights.avg_word_count,
             len(insights.common_headings),
             len(insights.common_secondary_keywords),
+            len(insights.top_entities),
         )
 
         # Persist as pipeline artifact so the frontend can inspect it
@@ -61,6 +62,7 @@ async def competitor_analyzer(state: SEOPipelineState) -> dict:
             "common_headings": insights.common_headings,
             "structural_signals": insights.structural_signals,
             "common_secondary_keywords": insights.common_secondary_keywords,
+            "top_entities": insights.top_entities,
             "pages": [
                 {
                     "url": p.url,
