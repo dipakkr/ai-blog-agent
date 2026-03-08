@@ -1,13 +1,75 @@
 # AI SEO Content Generation Platform
 
-FastAPI backend that generates SEO-optimized articles using a LangGraph agent pipeline. Takes a topic, analyzes top SERP results, scrapes competitor pages, identifies content gaps, classifies content format, generates a structured outline, writes the article section-by-section, injects links, scores it against SEO criteria, and conditionally revises until quality threshold is met.
+FastAPI backend that generates SEO-optimized articles using a LangGraph agent pipeline. Takes a topic, analyzes top SERP results, scrapes competitor pages, identifies content gaps, and produces publish-ready articles with SEO scoring and automated revisions.
 
-## Pipeline Architecture
+![Blog Agent](docs/demo-blog.png)
+
+## Quick Start
+
+```bash
+git clone <repo-url> && cd aiseo-backend
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env    # Add your ANTHROPIC_API_KEY (required)
+```
+
+### Run
+
+```bash
+# 1. Start the API server
+uvicorn app.main:app --reload --port 8000
+
+# 2. Start the worker (separate terminal)
+LOG_LEVEL=DEBUG python3 worker.py
+
+# 3. Frontend (optional)
+cd frontend && npm install && npm run dev               # :3000
+```
+
+> Redis is optional — without it, jobs run in-process as async tasks (no worker needed).
+
+### Generate an Article
+
+```bash
+curl -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"topic": "The 7 Best n8n Alternatives in 2025"}'
+# → {"job_id": "a20f2ef7-...", "status": "pending"}
+
+curl http://localhost:8000/jobs/a20f2ef7-...
+# → {"status": "completed", "result": { ... article JSON ... }}
+```
+
+### Tests
+
+```bash
+python3 -m pytest tests/ -v
+python3 -m pytest --cov=app tests/
+```
+
+<details>
+<summary>All environment variables</summary>
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `ANTHROPIC_API_KEY` | Yes | — | Claude API key |
+| `OPENAI_API_KEY` | No | — | OpenAI fallback key |
+| `SERPAPI_KEY` | No | — | SerpAPI key (mock fallback if missing) |
+| `REDIS_URL` | No | `redis://localhost:6379/0` | Redis connection |
+| `DATABASE_URL` | No | `sqlite:///./jobs.db` | Job persistence DB |
+| `LANGGRAPH_DB_PATH` | No | `./checkpoints.db` | LangGraph checkpoint DB |
+| `PRIMARY_LLM` | No | `claude-sonnet-4-6` | Primary model |
+| `FALLBACK_LLM` | No | `gpt-4o-mini` | Fallback model |
+| `SEO_SCORE_THRESHOLD` | No | `75.0` | Min score to pass |
+| `MAX_REVISION_COUNT` | No | `3` | Max revision iterations |
+| `LOG_LEVEL` | No | `INFO` | `DEBUG` to see LLM prompts |
+
+</details>
+
+## How It Works
 
 ```
 POST /generate → Job Manager (SQLite) → Redis Queue → LangGraph Pipeline → Article JSON
-
-Pipeline nodes (10 nodes, sequential with one conditional loop):
 
   START → serp_analyzer → competitor_analyzer → content_classifier → gap_finder
         → outline_generator → article_writer → link_strategist → faq_generator
@@ -15,122 +77,57 @@ Pipeline nodes (10 nodes, sequential with one conditional loop):
                      →[score >= 75]→ END
 ```
 
-Each node persists state via LangGraph's SQLite checkpointing. If the process crashes mid-pipeline, it resumes from the last completed node.
-
-### What Each Node Does
+Each node persists state via LangGraph's SQLite checkpointing — crashed jobs resume from last completed node.
 
 | Node | Purpose |
 |------|---------|
-| `serp_analyzer` | Fetches top SERP results for the topic via SerpAPI |
+| `serp_analyzer` | Fetches top SERP results via SerpAPI |
 | `competitor_analyzer` | Scrapes competitor pages for headings, word counts, structure |
-| `content_classifier` | Detects optimal format (listicle/tutorial/comparison/explainer), search intent, subcategory structure |
-| `gap_analyzer` | Identifies specific content gaps competitors miss |
-| `outline_generator` | Builds H2/H3 hierarchy consuming the strategy contract from classifier |
-| `article_writer` | Writes article section-by-section (single-shot for ≤2500 words, multi-shot for longer) |
-| `link_strategist` | Generates and injects internal/external links as markdown hyperlinks into content |
+| `content_classifier` | Detects format (listicle/tutorial/comparison/explainer), search intent, subcategories |
+| `gap_analyzer` | Identifies content gaps competitors miss |
+| `outline_generator` | Builds H2/H3 hierarchy from the classifier's strategy contract |
+| `article_writer` | Single-shot (≤2500 words) or multi-shot with rolling context window |
+| `link_strategist` | Generates and injects internal/external links into content |
 | `faq_generator` | Creates FAQ from People Also Ask data |
-| `seo_scorer` | Deterministic SEO validation (no LLM) across 11 criteria |
-| `revision_agent` | Rewrites weak sections based on scorer feedback |
+| `seo_scorer` | Deterministic SEO validation (no LLM) — 11 checks, 100 points |
+| `revision_agent` | Rewrites only sections that failed specific checks |
 
-### Key Design Decisions
+### Design Decisions
 
-- **Strategy contract** — `content_classifier` outputs a structured `ContentBrief` with search intent, subcategory detection, section count math, and pre-extracted tool names. `outline_generator` consumes this directly instead of re-deriving from raw SERP data.
-- **Deterministic pre-processing** — Tool name extraction, section count calculation, search intent detection, and heading cleanup are code functions (`utils/serp_utils.py`), not LLM tasks.
-- **Deterministic scoring** — `seo_scorer` uses pure Python checks (no LLM calls) across 11 criteria totaling 100 points
-- **Checkpoint recovery** — Failed jobs resume from last completed node via `/jobs/{id}/retry`
-- **Section-by-section writing** — Stays within token limits, enables targeted revision of weak sections
-- **Multi-model support** — Claude (primary) with OpenAI fallback, abstracted behind `services/llm_service.py`
+- **Strategy contract** — `content_classifier` outputs a typed `ContentBrief` (search intent, section count, tool names). Downstream nodes consume this directly.
+- **Deterministic pre-processing** — Tool extraction, section count math, heading cleanup are code functions, not LLM tasks.
+- **Deterministic scoring** — `seo_scorer` is pure Python (no LLM) across 11 criteria. Fully unit-tested.
+- **Checkpoint recovery** — Failed jobs resume from last completed node via `/jobs/{id}/retry`.
+- **Multi-model support** — Claude primary, OpenAI fallback, abstracted behind `services/llm_service.py`.
 
 ### SEO Scoring (11 Checks, 100 Points)
 
-| Check | Points | Criteria |
-|-------|--------|----------|
-| Keyword in title | 12 | Primary keyword appears in article title (fuzzy match) |
-| Keyword in first 100 words | 12 | Primary keyword in opening paragraph |
-| Keyword in H2 | 10 | Primary keyword in at least one H2 heading |
-| Keyword density 1-3% | 12 | Keyword density within optimal range (counts plurals) |
-| Meta description length | 8 | 150-160 characters |
-| Heading hierarchy | 8 | Valid H1 → H2 → H3 structure, no skips |
-| Internal links ≥ 3 | 8 | At least 3 internal link suggestions |
-| External links ≥ 2 | 8 | At least 2 external references |
-| Readability (Flesch > 60) | 5 | Flesch Reading Ease score above 60 |
-| Word count vs target | 10 | Within ±15% of target (full), ±30% (partial) |
-| Secondary keywords | 7 | All secondary keywords present in body |
+| Check | Pts | Check | Pts |
+|-------|-----|-------|-----|
+| Keyword in title | 12 | Heading hierarchy (H1→H2→H3) | 8 |
+| Keyword in first 100 words | 12 | Internal links ≥ 3 | 8 |
+| Keyword density 1-3% | 12 | External links ≥ 2 | 8 |
+| Keyword in H2 | 10 | Readability (Flesch > 60) | 5 |
+| Word count vs target (±15%) | 10 | Secondary keywords present | 7 |
+| Meta description 150-160 chars | 8 | | |
 
-Threshold: **75/100** to pass. Below triggers revision loop (max 3 iterations).
+Threshold: **75/100**. Below triggers revision loop (max 3 iterations).
 
-## Setup & Running
+## API
 
-### Requirements
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/generate` | Create article generation job → 202 with `job_id` |
+| `GET` | `/jobs/{id}` | Job status + result (article JSON when completed) |
+| `GET` | `/jobs` | List all jobs (newest first) |
+| `POST` | `/jobs/{id}/retry` | Resume failed job from last checkpoint |
+| `GET` | `/jobs/{id}/history` | Previous attempt snapshots |
+| `GET` | `/jobs/{id}/pipeline` | Intermediate artifacts (SERP, classification, gaps, outline, draft) |
 
-- Python 3.9+
-- Redis (for job queue; falls back to in-process execution if unavailable)
-- API keys: Anthropic (required), OpenAI (fallback), SerpAPI (optional, has mock fallback)
+**Status progression:** `pending` → `researching` → `outlining` → `drafting` → `scoring` → `revising` → `completed` / `failed`
 
-### Installation
-
-```bash
-git clone <repo-url> && cd aiseo-backend
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-```
-
-### Environment Variables
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with your values:
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | Yes | — | Claude API key (primary LLM) |
-| `OPENAI_API_KEY` | No | — | OpenAI key (fallback LLM) |
-| `SERPAPI_KEY` | No | — | SerpAPI key (falls back to mock data if missing) |
-| `REDIS_URL` | No | `redis://localhost:6379/0` | Redis connection URL |
-| `DATABASE_URL` | No | `sqlite:///./jobs.db` | SQLAlchemy DB URL for job persistence |
-| `LANGGRAPH_DB_PATH` | No | `./checkpoints.db` | SQLite path for LangGraph checkpoints |
-| `PRIMARY_LLM` | No | `claude-sonnet-4-6` | Primary model for all LLM calls |
-| `FALLBACK_LLM` | No | `gpt-4o-mini` | Fallback model when primary fails |
-| `SEO_SCORE_THRESHOLD` | No | `75.0` | Minimum SEO score to pass (0-100) |
-| `MAX_REVISION_COUNT` | No | `3` | Max revision loop iterations |
-| `LOG_LEVEL` | No | `INFO` | Logging level (`DEBUG` to see all LLM prompts/responses) |
-
-### Start the Service
-
-```bash
-# 1. Start Redis (optional — falls back to in-process async tasks without it)
-brew install redis && brew services start redis        # macOS
-# sudo apt install redis-server && sudo systemctl start redis  # Linux
-# docker run -d -p 6379:6379 redis:alpine                     # Docker
-
-# 2. Start the API server
-uvicorn app.main:app --reload --port 8000
-
-# 3. Start the RQ worker (picks jobs from Redis queue)
-rq worker seo_pipeline --worker-class rq.SimpleWorker  # macOS
-# rq worker seo_pipeline --with-scheduler              # Linux
-
-# 4. Frontend (optional)
-cd frontend && npm install && npm run dev
-```
-
-### Running Tests
-
-```bash
-python3 -m pytest tests/ -v              # All tests
-python3 -m pytest tests/test_seo_scorer.py -v  # Specific file
-python3 -m pytest --cov=app tests/       # With coverage
-```
-
-## API Routes
-
-### `POST /generate`
-
-Create a new article generation job. Returns immediately with `job_id`.
-
-**Request body:**
+<details>
+<summary>POST /generate request body</summary>
 
 ```json
 {
@@ -141,192 +138,74 @@ Create a new article generation job. Returns immediately with `job_id`.
 }
 ```
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `topic` | string | Yes | — | Article topic (3-500 chars) |
-| `primary_keyword` | string | No | topic | SEO target keyword |
-| `target_word_count` | int | No | 1500 | Target length (500-10000) |
-| `language` | string | No | `"en"` | Content language |
+Only `topic` is required. `primary_keyword` defaults to topic, `target_word_count` defaults to 1500.
 
-**Response** (202):
+</details>
 
-```json
-{
-  "job_id": "a20f2ef7-3018-47ae-bba1-fc9253287795",
-  "status": "pending"
-}
-```
-
----
-
-### `GET /jobs/{job_id}`
-
-Get job status and result. When status is `completed`, the `result` field contains the full article.
-
-**Response** (200):
+<details>
+<summary>GET /jobs/{id} response (completed)</summary>
 
 ```json
 {
   "job_id": "a20f2ef7",
   "status": "completed",
-  "topic": "The 7 Best n8n Alternatives in 2025",
-  "primary_keyword": "n8n alternatives",
-  "target_word_count": 1500,
-  "language": "en",
-  "created_at": "2025-03-08T10:00:00",
-  "updated_at": "2025-03-08T10:05:00",
-  "error": null,
   "result": {
-    "metadata": {
-      "title": "The 7 Best n8n Alternatives in 2025",
-      "meta_description": "...",
-      "primary_keyword": "n8n alternatives",
-      "secondary_keywords": ["workflow automation", "zapier alternative"],
-      "slug": "best-n8n-alternatives"
-    },
-    "sections": [
-      {
-        "heading": "Make (Integromat)",
-        "level": "h2",
-        "content": "...",
-        "word_count": 200
-      }
-    ],
-    "links": {
-      "internal": [{"anchor_text": "...", "suggested_url": "/blog/...", "context": "..."}],
-      "external": [{"anchor_text": "...", "url": "https://...", "domain": "...", "context": "..."}]
-    },
-    "faq": [{"question": "...", "answer": "..."}],
+    "metadata": { "title": "...", "meta_description": "...", "slug": "...", "primary_keyword": "...", "secondary_keywords": [] },
+    "sections": [{ "heading": "...", "level": "h2", "content": "...", "word_count": 200 }],
+    "links": { "internal": [{ "anchor_text": "...", "suggested_url": "/blog/..." }], "external": [{ "anchor_text": "...", "url": "https://..." }] },
+    "faq": [{ "question": "...", "answer": "..." }],
     "word_count": 1500,
-    "seo_score": {"total": 82.0, "checks": [...], "passed": true},
-    "keyword_analysis": {"primary_keyword": "n8n alternatives", "primary_density": 1.8, ...}
+    "seo_score": { "total": 82.0, "passed": true, "checks": ["..."] },
+    "keyword_analysis": { "primary_keyword": "...", "primary_density": 1.8 }
   }
 }
 ```
 
-**Job status progression:** `pending` → `researching` → `outlining` → `drafting` → `scoring` → `revising` (if needed) → `completed` / `failed`
+</details>
 
----
+## Sample Output
 
-### `GET /jobs`
+Generated articles in [`docs/sample/`](docs/sample/):
 
-List all jobs ordered by creation time (newest first).
-
-**Response** (200): Array of `JobDetailResponse` objects (same shape as `GET /jobs/{job_id}`).
-
----
-
-### `POST /jobs/{job_id}/retry`
-
-Resume a failed job from its last LangGraph checkpoint. Only `failed` jobs can be retried.
-
-**Response** (202):
-
-```json
-{
-  "job_id": "a20f2ef7",
-  "status": "pending"
-}
-```
-
-**Errors:**
-- `404` — Job not found
-- `409` — Job is not in `failed` status
-
----
-
-### `GET /jobs/{job_id}/history`
-
-Return all previous attempt snapshots for a job (populated on each retry).
-
-**Response** (200):
-
-```json
-[
-  {
-    "attempt": 1,
-    "timestamp": "2025-03-08T10:05:00",
-    "status": "failed",
-    "error": "Article quality too low (score 62/75) after 3 revision(s)",
-    "result": null
-  }
-]
-```
-
----
-
-### `GET /jobs/{job_id}/pipeline`
-
-Return intermediate pipeline artifacts for debugging. Each key corresponds to a completed pipeline node.
-
-**Response** (200):
-
-```json
-{
-  "serp": {
-    "query": "The 7 Best n8n Alternatives in 2025",
-    "results": [{"position": 1, "title": "...", "url": "...", "domain": "...", "snippet": "..."}],
-    "people_also_ask": ["Is there a free alternative to n8n?", "..."],
-    "themes": [{"theme": "workflow automation", "frequency": 5, "sources": ["..."]}]
-  },
-  "classification": {
-    "format": "listicle",
-    "search_intent": "commercial_investigation",
-    "has_subcategories": false,
-    "audience": "developer",
-    "suggested_section_count": 7,
-    "recommended_tools": ["Make", "Zapier", "Apache Airflow", "..."],
-    "competitive_angle": "..."
-  },
-  "gaps": [
-    {"topic": "Self-hosting comparison", "reason": "No competitor compares hosting options", "priority": "high"}
-  ],
-  "outline": {
-    "title": "...",
-    "meta_description": "...",
-    "sections": [{"heading": "...", "level": "h2", "key_points": ["..."]}]
-  },
-  "draft": {
-    "sections": [{"heading": "...", "content": "...", "word_count": 200}]
-  }
-}
-```
+- [The 7 Best n8n Alternatives](docs/sample/the-7-best-n8n-alternatives.md) (listicle)
+- [7 Best ChatGPT Alternatives](docs/sample/chatgpt-alternatives.md) (listicle)
+- [Prompting Essentials](docs/sample/prompting-essentials-learn-to-use-chatgpt-like-a-pro.md) (tutorial)
 
 ## Project Structure
 
 ```
 app/
-├── main.py                 # FastAPI endpoints (6 routes)
-├── config.py               # Settings via pydantic-settings
-├── queue.py                # Redis/RQ job queue with in-process fallback
-├── models/                 # Pydantic models
-│   ├── state.py            # SEOPipelineState (LangGraph state)
-│   ├── request.py          # API input models
-│   ├── article.py          # Article, SEO metadata, headings, links
-│   ├── serp.py             # SERPResult, ContentBrief, CompetitorInsights
-│   └── job.py              # Job status, response models
-├── agents/                 # LangGraph pipeline nodes
-│   ├── pipeline.py         # Graph definition + run_seo_pipeline()
-│   ├── serp_analyzer.py    # Fetch + analyze top SERP results
-│   ├── competitor_analyzer.py # Scrape competitor pages for structure
-│   ├── content_classifier.py # Detect format, intent, subcategories (strategy contract)
-│   ├── gap_analyzer.py     # Identify content gaps from SERP + scraped data
-│   ├── outline_gen.py      # Build heading hierarchy from strategy contract
-│   ├── article_writer.py   # Write article section by section
-│   ├── link_strategist.py  # Generate + inject links into content
-│   ├── faq_generator.py    # FAQ from "People Also Ask" patterns
-│   ├── seo_scorer.py       # Programmatic SEO validation (11 checks)
-│   └── revision_agent.py   # Rewrite weak sections based on score
+├── main.py                    # FastAPI endpoints (6 routes)
+├── config.py                  # pydantic-settings
+├── queue.py                   # Redis/RQ queue + in-process fallback
+├── models/                    # Pydantic data contracts
+│   ├── state.py               #   SEOPipelineState (LangGraph)
+│   ├── request.py             #   API input
+│   ├── article.py             #   Article, SEO metadata, links
+│   ├── serp.py                #   SERP results, ContentBrief
+│   └── job.py                 #   Job status, responses
+├── agents/                    # Pipeline nodes (10)
+│   ├── pipeline.py            #   Graph definition
+│   ├── serp_analyzer.py       #   SERP fetch
+│   ├── competitor_analyzer.py #   Page scraping
+│   ├── content_classifier.py  #   Format/intent detection
+│   ├── gap_analyzer.py        #   Content gaps
+│   ├── outline_gen.py         #   Heading hierarchy
+│   ├── article_writer.py      #   Section-by-section writing
+│   ├── link_strategist.py     #   Link injection
+│   ├── faq_generator.py       #   FAQ generation
+│   ├── seo_scorer.py          #   11-check validation
+│   └── revision_agent.py      #   Targeted rewrites
 ├── services/
-│   ├── serp_service.py     # SerpAPI integration + mock fallback
-│   ├── llm_service.py      # Multi-model abstraction (Claude/OpenAI)
-│   └── job_manager.py      # SQLite job persistence + status tracking
+│   ├── serp_service.py        #   SerpAPI + mock fallback
+│   ├── llm_service.py         #   Claude/OpenAI abstraction
+│   └── job_manager.py         #   SQLite job persistence
 └── utils/
-    ├── seo_utils.py        # Keyword density, Flesch-Kincaid, heading checks
-    ├── serp_utils.py       # Deterministic SERP pre-processing (heading cleanup, tool extraction, section count math)
-    └── text_utils.py       # Token counting, text cleaning, slugify
+    ├── seo_utils.py           #   Keyword density, Flesch, headings
+    ├── serp_utils.py          #   Heading cleanup, tool extraction
+    └── text_utils.py          #   Token counting, slugify
 tests/
-├── test_seo_scorer.py      # Unit tests for all 11 scoring checks
-├── test_api.py             # Integration tests for API endpoints
-└── test_services.py        # LLM service and SERP service tests
+├── test_seo_scorer.py         # 20+ scoring check tests
+├── test_api.py                # API integration tests
+└── test_services.py           # LLM + SERP service tests
 ```
